@@ -13,6 +13,7 @@ http://oversea-download.hikvision.com/uploadfile/Leaflet/ISAPI/HIKVISION%20ISAPI
 """
 import time
 import datetime
+from dataclasses import dataclass
 import logging
 import uuid
 from urllib.parse import quote
@@ -37,14 +38,43 @@ from pyhik.watchdog import Watchdog
 from pyhik.constants import (
     DEFAULT_PORT, DEFAULT_RTSP_PORT, DEFAULT_HEADERS, XML_NAMESPACE, SENSOR_MAP,
     CAM_DEVICE, NVR_DEVICE, CONNECT_TIMEOUT, READ_TIMEOUT, SNAPSHOT_TIMEOUT,
-    CONTEXT_INFO, CONTEXT_TRIG, CONTEXT_MOTION, CONTEXT_ALERT, CHANNEL_NAMES,
-    ID_TYPES, __version__)
+    RECORDING_SEARCH_TIMEOUT, CONTEXT_INFO, CONTEXT_TRIG, CONTEXT_MOTION,
+    CONTEXT_ALERT, CHANNEL_NAMES, ID_TYPES, __version__)
 
 # Register the default namespace to avoid ns0: prefixes in serialized XML
 ET.register_namespace('', XML_NAMESPACE)
 
 
 _LOGGING = logging.getLogger(__name__)
+
+
+@dataclass
+class Recording:
+    """Represents a recording from the Hikvision device."""
+
+    source_id: str
+    track_id: int
+    start_time: datetime.datetime
+    end_time: datetime.datetime
+    content_type: str
+    playback_uri: str
+
+
+@dataclass
+class RecordingDay:
+    """Represents a day with recordings available."""
+
+    date: datetime.datetime
+    has_recordings: bool
+
+
+@dataclass
+class VideoChannel:
+    """Represents a video input channel on a Hikvision device."""
+
+    id: int
+    name: str
+    enabled: bool = True
 
 # Hide nuisance requests logging
 logging.getLogger('urllib3').setLevel(logging.ERROR)
@@ -822,6 +852,257 @@ class HikCamera(object):
                         [False, channel, 0, datetime.datetime.now()]
                     )
 
+    def get_recording_days(self, track_id, start_date, end_date):
+        """Get days with recordings available.
+
+        Args:
+            track_id: The track ID to search (e.g., 101 for channel 1).
+            start_date: Start of the search range (datetime).
+            end_date: End of the search range (datetime).
+
+        Returns:
+            List of RecordingDay objects sorted by date descending.
+        """
+        days_with_recordings = {}
+        url = '%s/ISAPI/ContentMgmt/search' % self.root_url
+
+        # Search in 1-day windows to ensure we get all dates
+        window_size = datetime.timedelta(days=1)
+        current_start = start_date
+
+        while current_start < end_date:
+            current_end = min(current_start + window_size, end_date)
+
+            try:
+                # Generate a unique searchID for each request
+                search_id = str(uuid.uuid4()).upper()
+                search_xml = '''<?xml version="1.0" encoding="utf-8"?>
+<CMSearchDescription>
+<searchID>{search_id}</searchID>
+<trackIDList>
+<trackID>{track_id}</trackID>
+</trackIDList>
+<timeSpanList>
+<timeSpan>
+<startTime>{start_time}Z</startTime>
+<endTime>{end_time}Z</endTime>
+</timeSpan>
+</timeSpanList>
+<maxResults>500</maxResults>
+<searchResultPosition>0</searchResultPosition>
+<metadataList>
+<metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>
+</metadataList>
+</CMSearchDescription>'''.format(
+                    search_id=search_id,
+                    track_id=track_id,
+                    start_time=current_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                    end_time=current_end.strftime("%Y-%m-%dT%H:%M:%S")
+                )
+
+                response = self.hik_request.post(
+                    url,
+                    data=search_xml,
+                    headers={'Content-Type': 'application/xml'},
+                    timeout=RECORDING_SEARCH_TIMEOUT
+                )
+
+                if response.status_code != requests.codes.ok:
+                    current_start = current_end
+                    continue
+
+                root = ET.fromstring(response.text)
+
+                # Find all searchMatchItem elements (handle namespace)
+                for match in root.iter():
+                    if 'searchMatchItem' in match.tag:
+                        time_span = None
+                        for child in match:
+                            if 'timeSpan' in child.tag:
+                                time_span = child
+                                break
+                        if time_span is None:
+                            continue
+
+                        start_time_elem = None
+                        for child in time_span:
+                            if 'startTime' in child.tag:
+                                start_time_elem = child
+                                break
+                        if start_time_elem is None or not start_time_elem.text:
+                            continue
+
+                        # Handle Z suffix and parse datetime
+                        time_str = start_time_elem.text.replace('Z', '+00:00')
+                        try:
+                            rec_date = datetime.datetime.fromisoformat(time_str)
+                        except ValueError:
+                            # Try without timezone
+                            time_str = start_time_elem.text.rstrip('Z')
+                            try:
+                                rec_date = datetime.datetime.fromisoformat(time_str)
+                            except ValueError:
+                                continue
+
+                        date_key = rec_date.strftime("%Y-%m-%d")
+                        if date_key not in days_with_recordings:
+                            days_with_recordings[date_key] = RecordingDay(
+                                date=rec_date.replace(
+                                    hour=0, minute=0, second=0, microsecond=0
+                                ),
+                                has_recordings=True
+                            )
+
+            except (requests.exceptions.RequestException,
+                    requests.exceptions.ConnectionError,
+                    ET.ParseError) as err:
+                _LOGGING.warning('Failed to search recording days: %s', err)
+
+            current_start = current_end
+
+        return sorted(
+            days_with_recordings.values(),
+            key=lambda x: x.date,
+            reverse=True
+        )
+
+    def search_recordings(self, track_id, start_time, end_time, max_results=100):
+        """Search for recordings in a time range.
+
+        Args:
+            track_id: The track ID to search (e.g., 101 for channel 1).
+            start_time: Start of the search range (datetime).
+            end_time: End of the search range (datetime).
+            max_results: Maximum number of results to return.
+
+        Returns:
+            List of Recording objects sorted by start_time descending.
+        """
+        # Generate a unique searchID for each request
+        search_id = str(uuid.uuid4()).upper()
+        search_xml = '''<?xml version="1.0" encoding="utf-8"?>
+<CMSearchDescription>
+<searchID>{search_id}</searchID>
+<trackIDList>
+<trackID>{track_id}</trackID>
+</trackIDList>
+<timeSpanList>
+<timeSpan>
+<startTime>{start_time}Z</startTime>
+<endTime>{end_time}Z</endTime>
+</timeSpan>
+</timeSpanList>
+<maxResults>{max_results}</maxResults>
+<searchResultPosition>0</searchResultPosition>
+<metadataList>
+<metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor>
+</metadataList>
+</CMSearchDescription>'''.format(
+            search_id=search_id,
+            track_id=track_id,
+            start_time=start_time.strftime("%Y-%m-%dT%H:%M:%S"),
+            end_time=end_time.strftime("%Y-%m-%dT%H:%M:%S"),
+            max_results=max_results
+        )
+
+        recordings = []
+
+        try:
+            response = self.hik_request.post(
+                '%s/ISAPI/ContentMgmt/search' % self.root_url,
+                data=search_xml,
+                headers={'Content-Type': 'application/xml'},
+                timeout=RECORDING_SEARCH_TIMEOUT
+            )
+
+            if response.status_code == requests.codes.ok:
+                root = ET.fromstring(response.text)
+                recordings = self._parse_recording_results(root)
+
+        except (requests.exceptions.RequestException,
+                requests.exceptions.ConnectionError,
+                ET.ParseError) as err:
+            _LOGGING.warning('Failed to search recordings: %s', err)
+
+        return recordings
+
+    def _parse_recording_results(self, root):
+        """Parse search results from XML response.
+
+        Args:
+            root: The root element of the XML response.
+
+        Returns:
+            List of Recording objects.
+        """
+        recordings = []
+
+        for match in root.iter():
+            if 'searchMatchItem' not in match.tag:
+                continue
+
+            try:
+                source_id = ''
+                track_id_val = 101
+                rec_start = None
+                rec_end = None
+                playback_uri = ''
+                content_type = 'video'
+
+                for child in match:
+                    tag_name = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+
+                    if tag_name == 'sourceID' and child.text:
+                        source_id = child.text
+                    elif tag_name == 'trackID' and child.text:
+                        try:
+                            track_id_val = int(child.text)
+                        except ValueError:
+                            pass
+                    elif tag_name == 'timeSpan':
+                        for time_child in child:
+                            time_tag = time_child.tag.split('}')[-1] if '}' in time_child.tag else time_child.tag
+                            if time_tag == 'startTime' and time_child.text:
+                                try:
+                                    rec_start = datetime.datetime.fromisoformat(
+                                        time_child.text.replace('Z', '+00:00')
+                                    )
+                                except ValueError:
+                                    rec_start = datetime.datetime.fromisoformat(
+                                        time_child.text.rstrip('Z')
+                                    )
+                            elif time_tag == 'endTime' and time_child.text:
+                                try:
+                                    rec_end = datetime.datetime.fromisoformat(
+                                        time_child.text.replace('Z', '+00:00')
+                                    )
+                                except ValueError:
+                                    rec_end = datetime.datetime.fromisoformat(
+                                        time_child.text.rstrip('Z')
+                                    )
+                    elif tag_name == 'mediaSegmentDescriptor':
+                        for media_child in child:
+                            media_tag = media_child.tag.split('}')[-1] if '}' in media_child.tag else media_child.tag
+                            if media_tag == 'playbackURI' and media_child.text:
+                                playback_uri = media_child.text
+                            elif media_tag == 'contentType' and media_child.text:
+                                content_type = media_child.text
+
+                if rec_start is not None and rec_end is not None:
+                    recordings.append(Recording(
+                        source_id=source_id,
+                        track_id=track_id_val,
+                        start_time=rec_start,
+                        end_time=rec_end,
+                        content_type=content_type,
+                        playback_uri=playback_uri
+                    ))
+
+            except (ValueError, AttributeError):
+                continue
+
+        return sorted(recordings, key=lambda x: x.start_time, reverse=True)
+
 
 def inject_events_into_camera(camera, events):
     """Inject discovered events into the pyhik camera's event_states.
@@ -833,3 +1114,156 @@ def inject_events_into_camera(camera, events):
         events: Dict mapping event type names to lists of channel numbers.
     """
     camera.inject_events(events)
+
+
+def get_video_channels(host, port, username, password, ssl=False):
+    """Fetch available video input channels from Hikvision device.
+
+    This queries the ISAPI to discover available camera channels on
+    NVRs and standalone cameras.
+
+    Args:
+        host: Device hostname or IP address.
+        port: HTTP port number.
+        username: Authentication username.
+        password: Authentication password.
+        ssl: Whether to use HTTPS (default False).
+
+    Returns:
+        List of VideoChannel objects.
+    """
+    protocol = "https" if ssl else "http"
+    root_url = "{}://{}:{}".format(protocol, host, port)
+    channels = []
+
+    session = requests.Session()
+    session.auth = HTTPDigestAuth(username, password)
+    session.verify = ssl
+
+    # Try different ISAPI endpoints for channel discovery
+    urls = [
+        '{}/ISAPI/System/Video/inputs/channels'.format(root_url),
+        '{}/ISAPI/ContentMgmt/InputProxy/channels'.format(root_url),
+    ]
+
+    response = None
+    for url in urls:
+        try:
+            response = session.get(url, timeout=CONNECT_TIMEOUT)
+            if response.status_code == requests.codes.ok:
+                break
+        except requests.exceptions.RequestException:
+            continue
+
+    if response is None or response.status_code != requests.codes.ok:
+        # Fall back to streaming channels endpoint
+        try:
+            response = session.get(
+                '{}/ISAPI/Streaming/channels'.format(root_url),
+                timeout=CONNECT_TIMEOUT
+            )
+        except requests.exceptions.RequestException:
+            session.close()
+            return channels
+
+    if response is None or response.status_code != requests.codes.ok:
+        _LOGGING.warning('Unable to fetch video channels from device')
+        session.close()
+        return channels
+
+    try:
+        tree = ET.fromstring(response.text)
+    except ET.ParseError as err:
+        _LOGGING.error('Failed to parse video channels XML: %s', err)
+        session.close()
+        return channels
+
+    # Handle namespace
+    namespace = ""
+    root_tag = tree.tag
+    if root_tag.startswith("{"):
+        namespace = root_tag.split("}")[0] + "}"
+
+    # Try to find VideoInputChannel elements
+    channel_elements = tree.findall(".//{}VideoInputChannel".format(namespace))
+
+    # If not found, try InputProxyChannel
+    if not channel_elements:
+        channel_elements = tree.findall(".//{}InputProxyChannel".format(namespace))
+
+    # If still not found, try StreamingChannel
+    if not channel_elements:
+        channel_elements = tree.findall(".//{}StreamingChannel".format(namespace))
+        # Streaming channels have different structure - extract unique channel IDs
+        seen_channels = set()
+        for elem in channel_elements:
+            channel_id_elem = elem.find("{}id".format(namespace))
+            if channel_id_elem is not None and channel_id_elem.text:
+                try:
+                    # Channel IDs are formatted as (channel * 100) + stream_type
+                    full_id = int(channel_id_elem.text)
+                    channel_num = full_id // 100
+                    if channel_num > 0 and channel_num not in seen_channels:
+                        seen_channels.add(channel_num)
+                        name_elem = elem.find("{}channelName".format(namespace))
+                        channel_name = (
+                            name_elem.text
+                            if name_elem is not None and name_elem.text
+                            else "Channel {}".format(channel_num)
+                        )
+                        enabled_elem = elem.find("{}enabled".format(namespace))
+                        enabled = (
+                            enabled_elem.text.lower() == "true"
+                            if enabled_elem is not None and enabled_elem.text
+                            else True
+                        )
+                        channels.append(VideoChannel(
+                            id=channel_num,
+                            name=channel_name,
+                            enabled=enabled
+                        ))
+                except ValueError:
+                    continue
+        session.close()
+        return channels
+
+    # Process VideoInputChannel or InputProxyChannel elements
+    for elem in channel_elements:
+        channel_id_elem = elem.find("{}id".format(namespace))
+        if channel_id_elem is None or not channel_id_elem.text:
+            continue
+
+        try:
+            channel_id = int(channel_id_elem.text)
+        except ValueError:
+            continue
+
+        # Get channel name
+        name_elem = elem.find("{}name".format(namespace))
+        if name_elem is None or not name_elem.text:
+            name_elem = elem.find("{}channelName".format(namespace))
+        channel_name = (
+            name_elem.text
+            if name_elem is not None and name_elem.text
+            else "Channel {}".format(channel_id)
+        )
+
+        # Check if channel is enabled
+        enabled = True
+        enabled_elem = elem.find("{}enabled".format(namespace))
+        if enabled_elem is not None and enabled_elem.text:
+            enabled = enabled_elem.text.lower() == "true"
+
+        # For InputProxyChannel, also check online status
+        online_elem = elem.find("{}online".format(namespace))
+        if online_elem is not None and online_elem.text:
+            enabled = enabled and online_elem.text.lower() == "true"
+
+        channels.append(VideoChannel(
+            id=channel_id,
+            name=channel_name,
+            enabled=enabled
+        ))
+
+    session.close()
+    return channels
