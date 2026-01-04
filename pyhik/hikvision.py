@@ -141,6 +141,26 @@ class HikCamera(object):
         """Return current state of motion detection property"""
         return self.motion_detection
 
+    @property
+    def snapshot_url(self):
+        """Return the snapshot URL for channel 1."""
+        if self.device_type == NVR_DEVICE:
+            stream_channel = 101  # Channel 1 for NVR
+        else:
+            stream_channel = 1
+        return '%s/ISAPI/Streaming/channels/%d/picture' % (
+            self.root_url, stream_channel)
+
+    @property
+    def stream_url(self):
+        """Return the RTSP stream URL for channel 1 main stream."""
+        return self.get_stream_url(channel=1, stream_type=1)
+
+    @property
+    def channels(self):
+        """Return list of available channel numbers."""
+        return self.get_channels()
+
     def get_motion_detection(self):
         """Fetch current motion state from camera"""
         url = ('%s/ISAPI/System/Video/inputs/'
