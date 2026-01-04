@@ -15,6 +15,7 @@ import time
 import datetime
 import logging
 import uuid
+from urllib.parse import quote
 
 try:
     import xml.etree.cElementTree as ET
@@ -34,10 +35,10 @@ except ImportError:
 
 from pyhik.watchdog import Watchdog
 from pyhik.constants import (
-    DEFAULT_PORT, DEFAULT_HEADERS, XML_NAMESPACE, SENSOR_MAP,
-    CAM_DEVICE, NVR_DEVICE, CONNECT_TIMEOUT, READ_TIMEOUT, CONTEXT_INFO,
-    CONTEXT_TRIG, CONTEXT_MOTION, CONTEXT_ALERT, CHANNEL_NAMES, ID_TYPES,
-    __version__)
+    DEFAULT_PORT, DEFAULT_RTSP_PORT, DEFAULT_HEADERS, XML_NAMESPACE, SENSOR_MAP,
+    CAM_DEVICE, NVR_DEVICE, CONNECT_TIMEOUT, READ_TIMEOUT, SNAPSHOT_TIMEOUT,
+    CONTEXT_INFO, CONTEXT_TRIG, CONTEXT_MOTION, CONTEXT_ALERT, CHANNEL_NAMES,
+    ID_TYPES, __version__)
 
 
 _LOGGING = logging.getLogger(__name__)
@@ -218,6 +219,110 @@ class HikCamera(object):
             _LOGGING.error('Unable to set motion detection: %s', response.text)
 
         self.motion_detection = enable
+
+    def get_snapshot(self, channel=1):
+        """
+        Fetch a snapshot image from the camera.
+
+        Args:
+            channel: The channel number (1-based). For NVR devices, this is
+                     the camera channel. For standalone cameras, use 1.
+
+        Returns:
+            bytes: The snapshot image data, or None if the request fails.
+        """
+        # Calculate stream channel based on device type
+        # NVR uses channel * 100 + 1 format (e.g., channel 1 -> 101)
+        # Standalone cameras use channel 1
+        if self.device_type == NVR_DEVICE:
+            stream_channel = channel * 100 + 1
+        else:
+            stream_channel = 1
+
+        url = '%s/ISAPI/Streaming/channels/%d/picture' % (
+            self.root_url, stream_channel)
+
+        try:
+            response = self.hik_request.get(url, timeout=SNAPSHOT_TIMEOUT)
+        except requests.exceptions.Timeout:
+            _LOGGING.warning('Timeout fetching snapshot from %s', self.name)
+            return None
+        except (requests.exceptions.RequestException,
+                requests.exceptions.ConnectionError) as err:
+            _LOGGING.error('Unable to fetch snapshot, error: %s', err)
+            return None
+
+        if response.status_code == requests.codes.unauthorized:
+            _LOGGING.error('Authentication failed fetching snapshot')
+            return None
+
+        if response.status_code != requests.codes.ok:
+            _LOGGING.debug('Unable to fetch snapshot: %s', response.status_code)
+            return None
+
+        return response.content
+
+    def get_stream_url(self, channel=1, protocol='rtsp', stream_type=1):
+        """
+        Get the streaming URL for a camera channel.
+
+        Args:
+            channel: The channel number (1-based). For NVR devices, this is
+                     the camera channel. For standalone cameras, use 1.
+            protocol: The streaming protocol ('rtsp' is currently supported).
+            stream_type: Stream type (1 for main stream, 2 for sub stream).
+
+        Returns:
+            str: The stream URL with encoded credentials, or None if protocol
+                 is not supported.
+        """
+        if protocol != 'rtsp':
+            _LOGGING.warning('Unsupported stream protocol: %s', protocol)
+            return None
+
+        # Calculate stream channel based on device type
+        # NVR uses channel * 100 + stream_type format
+        # Standalone cameras use stream_type directly
+        if self.device_type == NVR_DEVICE:
+            stream_channel = channel * 100 + stream_type
+        else:
+            stream_channel = stream_type
+
+        # Extract host without port for RTSP URL
+        host = self.host
+
+        # URL encode credentials for safety
+        encoded_user = quote(self.usr, safe='')
+        encoded_pwd = quote(self.pwd, safe='')
+
+        return 'rtsp://%s:%s@%s:%d/Streaming/Channels/%d' % (
+            encoded_user, encoded_pwd, host, DEFAULT_RTSP_PORT, stream_channel)
+
+    def get_channels(self):
+        """
+        Get the list of available channels.
+
+        For NVR devices, returns a list of channel numbers based on the
+        event triggers. For standalone cameras, returns [1].
+
+        Returns:
+            list: List of available channel numbers (1-based).
+        """
+        channels = set()
+
+        if self.event_states:
+            for event_type, event_list in self.event_states.items():
+                for event_data in event_list:
+                    # event_data format: [state, channel, count, timestamp]
+                    channel = event_data[1]
+                    if channel > 0:
+                        channels.add(channel)
+
+        if not channels:
+            # Default to channel 1 if no events found
+            channels.add(1)
+
+        return sorted(list(channels))
 
     def add_update_callback(self, callback, sensor):
         """Register as callback for when a matching device sensor changes."""
