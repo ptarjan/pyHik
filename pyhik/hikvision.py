@@ -427,9 +427,9 @@ class HikCamera(object):
 
             for eventtrigger in event_xml:
                 ettype = eventtrigger.find(self.element_query('eventType', CONTEXT_TRIG))
-                # Catch empty xml defintions
+                # Catch empty xml definitions
                 if ettype is None:
-                    break
+                    continue
                 etnotify = eventtrigger.find(
                     self.element_query('EventTriggerNotificationList', CONTEXT_TRIG))
 
@@ -602,16 +602,21 @@ class HikCamera(object):
             estate = tree.find(
                 self.element_query('eventState', CONTEXT_ALERT)).text
 
+            echid = None
             for idtype in ID_TYPES:
-                echid = tree.find(self.element_query(idtype, CONTEXT_ALERT))
-                if echid is not None:
+                echid_elem = tree.find(self.element_query(idtype, CONTEXT_ALERT))
+                if echid_elem is not None:
                     try:
                         # Need to make sure this is actually a number
-                        echid = int(echid.text)
+                        echid = int(echid_elem.text)
                         break
                     except (ValueError, TypeError) as err:
                         # Field must not be an integer or is blank
                         pass
+
+            # Default to channel 1 if no valid channel ID was found
+            if echid is None:
+                echid = 1
 
             ecount = tree.find(
                 self.element_query('activePostCount', CONTEXT_ALERT)).text
