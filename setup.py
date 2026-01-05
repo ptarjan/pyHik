@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2025 John Mihalic <https://github.com/mezz64>
+# Copyright (c) 2016-2026 John Mihalic <https://github.com/mezz64>
 # Licensed under the MIT license.
 
 # Used this guide to create module
@@ -12,17 +12,34 @@
 # python setup.py sdist upload -r pypi
 
 
-from distutils.core import setup
+from setuptools import setup
+
 setup(
     name='pyHik',
     packages=['pyhik'],
-    version='0.3.4',
-    description='Provides a python api to interact with a Hikvision camera event stream and toggle motion detection.',
+    version='0.4.0',
+    description='Python API for Hikvision cameras and NVRs - event streaming, ISAPI access, and device control.',
     author='John Mihalic',
     author_email='mezz64@users.noreply.github.com',
     license='MIT',
     url='https://github.com/mezz64/pyhik',
-    download_url='https://github.com/mezz64/pyhik/tarball/0.3.4',
-    keywords=['hik', 'hikvision', 'event stream', 'events', 'api wrapper', 'homeassistant'],
-    classifiers=[],
-    )
+    download_url='https://github.com/mezz64/pyhik/tarball/0.4.0',
+    keywords=['hik', 'hikvision', 'event stream', 'events', 'api wrapper', 'homeassistant', 'isapi', 'nvr', 'camera'],
+    classifiers=[
+        'Development Status :: 4 - Beta',
+        'Intended Audience :: Developers',
+        'License :: OSI Approved :: MIT License',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+    ],
+    python_requires='>=3.9',
+    install_requires=[
+        'requests>=2.20.0',
+    ],
+    extras_require={
+        'isapi': ['xmltodict>=0.13.0'],
+    },
+)
