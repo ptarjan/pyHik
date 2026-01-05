@@ -40,6 +40,9 @@ from pyhik.constants import (
     CONTEXT_INFO, CONTEXT_TRIG, CONTEXT_MOTION, CONTEXT_ALERT, CHANNEL_NAMES,
     ID_TYPES, __version__)
 
+# Register the default namespace to avoid ns0: prefixes in serialized XML
+ET.register_namespace('', XML_NAMESPACE)
+
 
 _LOGGING = logging.getLogger(__name__)
 
