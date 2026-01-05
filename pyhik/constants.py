@@ -14,8 +14,10 @@ __version__ = '{}.{}.{}'.format(
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 60
+SNAPSHOT_TIMEOUT = 10
 
 DEFAULT_PORT = 80
+DEFAULT_RTSP_PORT = 554
 XML_ENCODING = 'UTF-8'
 XML_NAMESPACE = 'http://www.hikvision.com/ver20/XMLSchema'
 
